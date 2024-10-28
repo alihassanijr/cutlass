@@ -261,21 +261,31 @@ def is_tile_desc_valid(tile_description):
         tile_description.math_instruction.element_accumulator
     )
 
-    cluster_shape, cta_shape, inst_shape = (
+    cluster_size, cta_shape, _ = (
         tile_description.cluster_shape,
         tile_description.threadblock_shape,
         tile_description.math_instruction.instruction_shape
     )
     grid_size = (
-        cta_shape[0] * cluster_shape[0] +
-        cta_shape[1] * cluster_shape[1] +
-        cta_shape[2] * cluster_shape[2]
+        cta_shape[0] * cluster_size[0] +
+        cta_shape[1] * cluster_size[1] +
+        cta_shape[2] * cluster_size[2]
     )
-    cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
+    num_ctas_in_cluster = cluster_size[0] * cluster_size[1] * cluster_size[2]
+    cluster_shape = (
+        cluster_size[0] * cta_shape[0],
+        cluster_size[1] * cta_shape[1],
+        cluster_size[2] * cta_shape[2]
+    )
+
+    FP32_TYPES = [DataType.f32, DataType.tf32]
+    FP16_TYPES = [DataType.f16, DataType.bf16]
+    is_fp32 = element_a in FP32_TYPES and element_b in FP32_TYPES
+    is_fp16 = element_a in FP16_TYPES and element_b in FP16_TYPES
 
     # Maximum number of CTAs per cluster is 8 for Hopper, but up to 16 is
     # allowed for non portable clusters.
-    if cluster_size > 16 or cluster_size < 1:
+    if num_ctas_in_cluster > 16 or num_ctas_in_cluster < 1:
         return False
 
     if grid_size < 1:
@@ -299,8 +309,17 @@ def is_tile_desc_valid(tile_description):
     if cta_shape[2] < 16 or cta_shape[2] % 8 != 0:
         return False
 
-    # Minimum of 2 stages
-    if cta_shape[2] < inst_shape[2] or cta_shape[2] % inst_shape[2] != 0 or cta_shape[2] / inst_shape[2] < 2:
+    # Minimum of 2 stages (very rough heuristic that may filter out valid kernel configs)
+    if (cluster_shape[0] >= 128 or cluster_shape[1] >= 128) and cluster_shape[2] >= 256:
+        return False
+
+    if is_fp32 and (cluster_shape[0] >= 128 or cluster_shape[1] >= 128) and cluster_shape[2] >= 128:
+        return False
+
+    if is_fp32 and cluster_shape[0] >= 256 and cluster_shape[1] >= 256 and cluster_shape[2] >= 64:
+        return False
+
+    if is_fp16 and cluster_shape[0] >= 256 and cluster_shape[1] >= 256 and cluster_shape[2] >= 128:
         return False
 
     # CTA shape upper bound: <256, 256, 256>
@@ -329,6 +348,10 @@ def generate_tile_descriptions_sm90(math_instructions, is_aligned: bool, level: 
     tile_descriptions = set()
     mma_multipliers, cluster_sizes = get_mma_multipliers(level), get_cluster_sizes(level, is_aligned)
     for math_inst, mma_mul, cluster_size in product(math_instructions, mma_multipliers, cluster_sizes):
+
+        math_inst_stub = copy.deepcopy(math_inst)
+        math_inst_stub.instruction_shape = [1, 1, 1]
+
         tile_desc = TileDescription(
             threadblock_shape=[
                 math_inst.instruction_shape[0] * mma_mul[0],
@@ -337,7 +360,9 @@ def generate_tile_descriptions_sm90(math_instructions, is_aligned: bool, level: 
             ],
             stages=0,
             warp_count=[4, 1, 1],
-            math_instruction=math_inst,
+            math_instruction=math_inst_stub, # Instruction shape is no longer a template argument in 3.X,
+                                             # similar to warp count, and is therefore set to a constant
+                                             # to prevent duplicate kernels.
             min_compute=90,
             max_compute=90,
             cluster_shape=cluster_size)
@@ -425,6 +450,25 @@ def get_valid_schedules(tile_description, cuda_version, is_aligned, data_types, 
     c_type = data_types["c_type"]
     d_type = data_types["d_type"]
     is_void_c = c_type == DataType.void
+
+    # Filter out invalid kernels
+    is_nt = layout[0][0] == LayoutType.ColumnMajor and layout[1][0] == LayoutType.RowMajor
+    is_tn = layout[0][0] == LayoutType.RowMajor and layout[1][0] == LayoutType.ColumnMajor
+    is_nn = layout[0][0] == LayoutType.ColumnMajor and layout[1][0] == LayoutType.ColumnMajor
+
+    # static_assert(size<0>(SmemLayoutB{}) % WarpgroupTileSize == 0,
+    #   "Copy size must evenly divide SMEM tile.");
+    if is_fp32 and is_nt and (cta_n % cta_k != 0):
+        return [], []
+
+    # static_assert(!TransposeB || (cutlass::bits_to_bytes((size<1>(SmemLayoutB{}) * sizeof_bits<InternalElementB>::value))) == 128,
+    # "SmemLayoutB K must be 128bytes to be transposed.")
+    if is_fp32 and is_nt and cta_k != 32:
+        return [], []
+
+    # Static assert failure when instantiating SmemLayoutB
+    if is_fp32 and (is_tn or is_nn) and (cta_n % cta_k != 0):
+        return [], []
 
     # Early pruning
     if level < 1:
